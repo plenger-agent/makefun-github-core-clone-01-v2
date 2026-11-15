@@ -220,6 +220,9 @@ function writeResponse(socket: Socket, req: HttpRequest, res: HttpResponse, keep
 }
 
 /** Serve one connection: parse, dispatch in order, answer, repeat while keep-alive lasts. */
+// Invariant: `pump` is single-flight per socket (the `busy` flag) and owns `buffer` exclusively —
+// data/end events only append and re-kick it — so pipelined requests can never be dispatched or
+// answered out of order, and a response is fully written before the next request is handled.
 function serveSocket(socket: Socket, handler: HttpHandler): void {
   socket.setNoDelay(true);
   socket.setTimeout(IDLE_TIMEOUT_MS, () => socket.destroy());

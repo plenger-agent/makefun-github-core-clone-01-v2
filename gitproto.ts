@@ -1,20 +1,25 @@
-// Git smart HTTP: the info/refs advertisements (protocol v2 and v0), v2 ls-refs and fetch, v0 fetch,
-// and v0 receive-pack with report-status. The suite's client speaks the wire protocol in-process, so
-// this module implements the protocol itself: pkt-line framing, pack v2 reading (with delta
-// resolution) and writing (plain objects — always valid), shallow/deepen bookkeeping, and per-ref
-// fast-forward enforcement on push.
+// Git smart HTTP: the info/refs advertisements (protocol v2 and v0), v2
+// ls-refs and fetch, v0 fetch, and v0 receive-pack with report-status. The
+// suite's client speaks the wire protocol in-process, so this module
+// implements the protocol itself: pkt-line framing, pack v2 reading (with
+// delta resolution) and writing (plain objects — always valid),
+// shallow/deepen bookkeeping, and per-ref fast-forward enforcement on push.
 //
-// Everything is served from the shared Forge store: objects pushed here are the objects the REST
-// contents API and clones see.
+// Everything is served from the shared Forge store: objects pushed here are
+// the objects the REST contents API and clones see.
 //
-// v2 adds two caches on top of v1, both sound because the object store is content-addressed and
-// append-only (objects are never mutated or deleted, so the reachable closure of a fixed oid set
-// can never change):
-//   - fetch answers (v0 and v2) are cached by the exact inputs the plan depends on — wants, haves,
-//     the client's shallow set and depth — plus a store fingerprint (object count and this repo's
-//     ref tips). The clone workload asks fifty times for the same depth-1 pack; it is built once.
-//   - ls-refs answers are cached by their flags/prefixes plus the same ref fingerprint.
-// The v2 capability advertisement carries no per-repo data at all, so it is built once, up front.
+// v2 adds two caches on top of v1, both sound because the object store is
+// content-addressed and append-only (objects are never mutated or deleted,
+// so the reachable closure of a fixed oid set can never change):
+//   - fetch answers (v0 and v2) are cached by the exact inputs the plan
+//     depends on — wants, haves, the client's shallow set and depth — plus
+//     a store fingerprint (object count and this repo's ref tips). The
+//     clone workload asks fifty times for the same depth-1 pack; it is
+//     built once.
+//   - ls-refs answers are cached by their flags/prefixes plus the same ref
+//     fingerprint.
+// The v2 capability advertisement carries no per-repo data at all, so it is
+// built once, up front.
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -23,8 +28,8 @@ import { isAuthenticated, readBody, sendBytes, sendError } from './web.ts';
 import type { HttpRequest, HttpResponse } from './server.ts';
 
 const AGENT = 'plenger-forge/1.0.0';
-const TYPE_IDS: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-const TYPE_NAMES: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
+const TYPE_TO_ID: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+const ID_TO_TYPE: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
 // ---------------------------------------------------------------------------------------------
 // pkt-line framing
@@ -46,31 +51,31 @@ interface Packet {
 
 /** Decode a pkt-line stream; trailing bytes that are not framed are returned as `rest`. */
 function decodePackets(data: Buffer, offset = 0): { packets: Packet[]; rest: Buffer } {
-  const packets: Packet[] = [];
-  let cursor = offset;
-  while (cursor + 4 <= data.length) {
-    const hex = data.toString('ascii', cursor, cursor + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(hex)) break;
-    const length = Number.parseInt(hex, 16);
-    if (length === 0) {
-      packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
-      cursor += 4;
+  const frames: Packet[] = [];
+  let pos = offset;
+  while (pos + 4 <= data.length) {
+    const hexText = data.toString('ascii', pos, pos + 4);
+    if (!/^[0-9a-fA-F]{4}$/.test(hexText)) break;
+    const frameLen = Number.parseInt(hexText, 16);
+    if (frameLen === 0) {
+      frames.push({ kind: 'flush', payload: Buffer.alloc(0) });
+      pos += 4;
       continue;
     }
-    if (length === 1) {
-      packets.push({ kind: 'delim', payload: Buffer.alloc(0) });
-      cursor += 4;
+    if (frameLen === 1) {
+      frames.push({ kind: 'delim', payload: Buffer.alloc(0) });
+      pos += 4;
       continue;
     }
-    if (length === 2) {
-      cursor += 4;
+    if (frameLen === 2) {
+      pos += 4;
       continue;
     }
-    if (length < 4 || cursor + length > data.length) break;
-    packets.push({ kind: 'data', payload: data.subarray(cursor + 4, cursor + length) });
-    cursor += length;
+    if (frameLen < 4 || pos + frameLen > data.length) break;
+    frames.push({ kind: 'data', payload: data.subarray(pos + 4, pos + frameLen) });
+    pos += frameLen;
   }
-  return { packets, rest: data.subarray(cursor) };
+  return { packets: frames, rest: data.subarray(pos) };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -79,224 +84,227 @@ function decodePackets(data: Buffer, offset = 0): { packets: Packet[]; rest: Buf
 
 /** Serialize objects into a pack v2 (plain entries, zlib-deflated) with its SHA-1 trailer. */
 export function writePack(objects: readonly GitObj[]): Buffer {
-  const parts: Buffer[] = [];
-  const header = Buffer.alloc(12);
-  header.write('PACK', 0, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(objects.length, 8);
-  parts.push(header);
-  for (const object of objects) {
-    const size = object.data.length;
-    const typeId = TYPE_IDS[object.type];
-    const bytes: number[] = [];
-    let first = (typeId << 4) | (size & 0x0f);
-    let rest = size >> 4;
-    if (rest > 0) first |= 0x80;
-    bytes.push(first);
-    while (rest > 0) {
-      let byte = rest & 0x7f;
-      rest >>= 7;
-      if (rest > 0) byte |= 0x80;
-      bytes.push(byte);
+  const chunks: Buffer[] = [];
+  const packHeader = Buffer.alloc(12);
+  packHeader.write('PACK', 0, 'ascii');
+  packHeader.writeUInt32BE(2, 4);
+  packHeader.writeUInt32BE(objects.length, 8);
+  chunks.push(packHeader);
+  for (const obj of objects) {
+    const dataLen = obj.data.length;
+    const tid = TYPE_TO_ID[obj.type];
+    const headBytes: number[] = [];
+    let lead = (tid << 4) | (dataLen & 0x0f);
+    let remaining = dataLen >> 4;
+    if (remaining > 0) lead |= 0x80;
+    headBytes.push(lead);
+    while (remaining > 0) {
+      let chunkByte = remaining & 0x7f;
+      remaining >>= 7;
+      if (remaining > 0) chunkByte |= 0x80;
+      headBytes.push(chunkByte);
     }
-    parts.push(Buffer.from(bytes));
-    parts.push(deflateSync(object.data));
+    chunks.push(Buffer.from(headBytes));
+    chunks.push(deflateSync(obj.data));
   }
-  const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const packBody = Buffer.concat(chunks);
+  const checksum = createHash('sha1').update(packBody).digest();
+  return Buffer.concat([packBody, checksum]);
 }
 
 /** Apply a git delta (copy/insert instructions) to a base object's bytes. */
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
-  let offset = 0;
-  const readVarint = (): number => {
-    let value = 0;
-    let shift = 0;
+  let pos = 0;
+  const readSize = (): number => {
+    let acc = 0;
+    let shiftBits = 0;
     for (;;) {
-      const byte = delta[offset]!;
-      offset += 1;
-      value |= (byte & 0x7f) << shift;
-      shift += 7;
-      if ((byte & 0x80) === 0) break;
+      const rawByte = delta[pos]!;
+      pos += 1;
+      acc |= (rawByte & 0x7f) << shiftBits;
+      shiftBits += 7;
+      if ((rawByte & 0x80) === 0) break;
     }
-    return value;
+    return acc;
   };
-  readVarint(); // base size
-  const targetSize = readVarint();
-  const out: Buffer[] = [];
-  let produced = 0;
-  while (offset < delta.length) {
-    const op = delta[offset]!;
-    offset += 1;
-    if (op & 0x80) {
-      let copyOffset = 0;
-      let copySize = 0;
-      for (let bit = 0; bit < 4; bit += 1) {
-        if (op & (1 << bit)) {
-          copyOffset |= delta[offset]! << (8 * bit);
-          offset += 1;
+  readSize(); // base size
+  const expectedSize = readSize();
+  const pieces: Buffer[] = [];
+  let emitted = 0;
+  while (pos < delta.length) {
+    const opcode = delta[pos]!;
+    pos += 1;
+    if (opcode & 0x80) {
+      let srcOffset = 0;
+      let srcSize = 0;
+      for (let bitIndex = 0; bitIndex < 4; bitIndex += 1) {
+        if (opcode & (1 << bitIndex)) {
+          srcOffset |= delta[pos]! << (8 * bitIndex);
+          pos += 1;
         }
       }
-      for (let bit = 0; bit < 3; bit += 1) {
-        if (op & (0x10 << bit)) {
-          copySize |= delta[offset]! << (8 * bit);
-          offset += 1;
+      for (let bitIndex = 0; bitIndex < 3; bitIndex += 1) {
+        if (opcode & (0x10 << bitIndex)) {
+          srcSize |= delta[pos]! << (8 * bitIndex);
+          pos += 1;
         }
       }
-      if (copySize === 0) copySize = 0x10000;
-      out.push(base.subarray(copyOffset, copyOffset + copySize));
-      produced += copySize;
-    } else if (op > 0) {
-      out.push(delta.subarray(offset, offset + op));
-      produced += op;
-      offset += op;
+      if (srcSize === 0) srcSize = 0x10000;
+      pieces.push(base.subarray(srcOffset, srcOffset + srcSize));
+      emitted += srcSize;
+    } else if (opcode > 0) {
+      pieces.push(delta.subarray(pos, pos + opcode));
+      emitted += opcode;
+      pos += opcode;
     } else {
       throw new Error('delta opcode 0');
     }
   }
-  const result = Buffer.concat(out);
-  if (result.length !== targetSize || produced !== targetSize) throw new Error('delta size mismatch');
-  return result;
+  const assembled = Buffer.concat(pieces);
+  if (assembled.length !== expectedSize || emitted !== expectedSize) throw new Error('delta size mismatch');
+  return assembled;
 }
 
 /**
- * Parse a received pack into the store. Entries may be plain or delta-compressed (OFS/REF); thin-pack
- * bases are looked up in the store. Throws on structural corruption.
+ * Parse a received pack into the store. Entries may be plain or
+ * delta-compressed (OFS/REF); thin-pack bases are looked up in the store.
+ * Throws on structural corruption.
  */
-export function readPackInto(forge: Forge, pack: Buffer): void {
-  if (pack.length < 12 + 20) throw new Error('pack too short');
-  if (pack.toString('ascii', 0, 4) !== 'PACK') throw new Error('bad pack signature');
-  const count = pack.readUInt32BE(8);
-  let offset = 12;
-  interface RawEntry {
+export function readPackInto(forge: Forge, packBytes: Buffer): void {
+  if (packBytes.length < 12 + 20) throw new Error('pack too short');
+  if (packBytes.toString('ascii', 0, 4) !== 'PACK') throw new Error('bad pack signature');
+  const entryCount = packBytes.readUInt32BE(8);
+  let pos = 12;
+  interface PackEntry {
     type: ObjType;
     data?: Buffer;
     baseOid?: string;
     baseOffset?: number;
     start: number;
   }
-  const entries: RawEntry[] = [];
-  const byOffset = new Map<number, number>();
-  for (let index = 0; index < count; index += 1) {
-    const start = offset;
-    let byte = pack[offset]!;
-    offset += 1;
-    const typeId = (byte >> 4) & 0x7;
-    let size = byte & 0x0f;
-    let shift = 4;
-    while (byte & 0x80) {
-      byte = pack[offset]!;
-      offset += 1;
-      size |= (byte & 0x7f) << shift;
-      shift += 7;
+  const rawEntries: PackEntry[] = [];
+  const indexByStart = new Map<number, number>();
+  for (let i = 0; i < entryCount; i += 1) {
+    const entryStart = pos;
+    let leadByte = packBytes[pos]!;
+    pos += 1;
+    const tid = (leadByte >> 4) & 0x7;
+    let dataSize = leadByte & 0x0f;
+    let shiftBits = 4;
+    while (leadByte & 0x80) {
+      leadByte = packBytes[pos]!;
+      pos += 1;
+      dataSize |= (leadByte & 0x7f) << shiftBits;
+      shiftBits += 7;
     }
-    const entry: RawEntry = { type: TYPE_NAMES[typeId] ?? 'blob', start };
-    if (typeId === 6) {
+    const raw: PackEntry = { type: ID_TO_TYPE[tid] ?? 'blob', start: entryStart };
+    if (tid === 6) {
       // OFS_DELTA
-      let back = pack[offset]!;
-      offset += 1;
-      let baseOffset = back & 0x7f;
-      while (back & 0x80) {
-        back = pack[offset]!;
-        offset += 1;
-        baseOffset = ((baseOffset + 1) << 7) | (back & 0x7f);
+      let backByte = packBytes[pos]!;
+      pos += 1;
+      let backDist = backByte & 0x7f;
+      while (backByte & 0x80) {
+        backByte = packBytes[pos]!;
+        pos += 1;
+        backDist = ((backDist + 1) << 7) | (backByte & 0x7f);
       }
-      entry.baseOffset = start - baseOffset;
-      entry.type = 'blob'; // resolved below
-    } else if (typeId === 7) {
+      raw.baseOffset = entryStart - backDist;
+      raw.type = 'blob'; // resolved below
+    } else if (tid === 7) {
       // REF_DELTA
-      entry.baseOid = pack.toString('hex', offset, offset + 20);
-      offset += 20;
-      entry.type = 'blob'; // resolved below
+      raw.baseOid = packBytes.toString('hex', pos, pos + 20);
+      pos += 20;
+      raw.type = 'blob'; // resolved below
     } else {
-      const inflated = inflateSync(pack.subarray(offset));
-      if (inflated.length !== size) throw new Error('pack entry size mismatch');
-      entry.data = inflated;
-      offset += compressedLength(pack, offset, inflated.length);
+      const plainBytes = inflateSync(packBytes.subarray(pos));
+      if (plainBytes.length !== dataSize) throw new Error('pack entry size mismatch');
+      raw.data = plainBytes;
+      pos += compressedLength(packBytes, pos, plainBytes.length);
     }
-    if (entry.baseOid !== undefined || entry.baseOffset !== undefined) {
-      const inflated = inflateSync(pack.subarray(offset));
-      entry.data = inflated; // the delta bytes, for now
-      offset += compressedLength(pack, offset, inflated.length);
+    if (raw.baseOid !== undefined || raw.baseOffset !== undefined) {
+      const deltaBytes = inflateSync(packBytes.subarray(pos));
+      raw.data = deltaBytes; // the delta bytes, for now
+      pos += compressedLength(packBytes, pos, deltaBytes.length);
       // stash delta bytes in `data` and mark via base fields; resolved in pass two
-      entries.push(entry);
-      byOffset.set(start, entries.length - 1);
+      rawEntries.push(raw);
+      indexByStart.set(entryStart, rawEntries.length - 1);
       continue;
     }
-    entries.push(entry);
-    byOffset.set(start, entries.length - 1);
+    rawEntries.push(raw);
+    indexByStart.set(entryStart, rawEntries.length - 1);
   }
   // Pass two: resolve deltas (bases may themselves be deltas).
-  const resolved = new Map<number, { type: ObjType; data: Buffer }>();
-  const resolve = (index: number): { type: ObjType; data: Buffer } => {
-    const cached = resolved.get(index);
-    if (cached !== undefined) return cached;
-    const entry = entries[index]!;
-    let result: { type: ObjType; data: Buffer };
-    if (entry.baseOid === undefined && entry.baseOffset === undefined) {
-      result = { type: entry.type, data: entry.data! };
+  const resolvedEntries = new Map<number, { type: ObjType; data: Buffer }>();
+  const resolveEntry = (index: number): { type: ObjType; data: Buffer } => {
+    const memo = resolvedEntries.get(index);
+    if (memo !== undefined) return memo;
+    const raw = rawEntries[index]!;
+    let outcome: { type: ObjType; data: Buffer };
+    if (raw.baseOid === undefined && raw.baseOffset === undefined) {
+      outcome = { type: raw.type, data: raw.data! };
     } else {
-      let base: { type: ObjType; data: Buffer };
-      if (entry.baseOid !== undefined) {
-        const baseObject = forge.getObject(entry.baseOid);
-        if (baseObject === undefined) throw new Error('thin pack base is missing');
-        base = baseObject;
+      let baseObj: { type: ObjType; data: Buffer };
+      if (raw.baseOid !== undefined) {
+        const storedBase = forge.getObject(raw.baseOid);
+        if (storedBase === undefined) throw new Error('thin pack base is missing');
+        baseObj = storedBase;
       } else {
-        const baseIndex = byOffset.get(entry.baseOffset!);
-        if (baseIndex === undefined) throw new Error('ofs delta base is missing');
-        base = resolve(baseIndex);
+        const baseIdx = indexByStart.get(raw.baseOffset!);
+        if (baseIdx === undefined) throw new Error('ofs delta base is missing');
+        baseObj = resolveEntry(baseIdx);
       }
-      result = { type: base.type, data: applyDelta(base.data, entry.data!) };
+      outcome = { type: baseObj.type, data: applyDelta(baseObj.data, raw.data!) };
     }
-    resolved.set(index, result);
-    return result;
+    resolvedEntries.set(index, outcome);
+    return outcome;
   };
-  for (let index = 0; index < entries.length; index += 1) {
-    const object = resolve(index);
-    forge.putObject(object.type, object.data);
+  for (let i = 0; i < rawEntries.length; i += 1) {
+    const finalObj = resolveEntry(i);
+    forge.putObject(finalObj.type, finalObj.data);
   }
 }
 
 /**
- * The number of compressed bytes an entry occupies in the pack. zlib streams are self-terminating
- * and Node's inflateSync tolerates trailing bytes, so "a prefix inflates to the full payload" is
- * monotone in the prefix length: bracket the length exponentially, then binary-search inside the
- * bracket, keeping the total re-inflation work within a small multiple of the entry's own size.
+ * The number of compressed bytes an entry occupies in the pack. zlib streams
+ * are self-terminating and Node's inflateSync tolerates trailing bytes, so
+ * "a prefix inflates to the full payload" is monotone in the prefix length:
+ * bracket the length exponentially, then binary-search inside the bracket,
+ * keeping the total re-inflation work within a small multiple of the
+ * entry's own size.
  */
-function compressedLength(pack: Buffer, offset: number, inflatedLength: number): number {
-  const remaining = pack.length - offset;
-  const inflates = (length: number): boolean => {
+function compressedLength(packBytes: Buffer, startAt: number, plainLen: number): number {
+  const bytesLeft = packBytes.length - startAt;
+  const tryInflate = (length: number): boolean => {
     try {
-      return inflateSync(pack.subarray(offset, offset + length)).length === inflatedLength;
+      return inflateSync(packBytes.subarray(startAt, startAt + length)).length === plainLen;
     } catch {
       return false;
     }
   };
-  let low = 0; // known to fail (or the empty prefix)
-  let high = Math.min(remaining, 1024);
-  while (!inflates(high)) {
-    low = high;
-    if (high >= remaining) return remaining;
-    high = Math.min(remaining, high * 4);
+  let lo = 0; // known to fail (or the empty prefix)
+  let hi = Math.min(bytesLeft, 1024);
+  while (!tryInflate(hi)) {
+    lo = hi;
+    if (hi >= bytesLeft) return bytesLeft;
+    hi = Math.min(bytesLeft, hi * 4);
   }
-  while (low + 1 < high) {
-    const mid = (low + high) >> 1;
-    if (inflates(mid)) high = mid;
-    else low = mid;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (tryInflate(mid)) hi = mid;
+    else lo = mid;
   }
-  return high;
+  return hi;
 }
 
 // ---------------------------------------------------------------------------------------------
 // ref advertisement
 // ---------------------------------------------------------------------------------------------
 
-function sortedRefs(repo: Repo): Array<[string, string]> {
+function refsInOrder(repo: Repo): Array<[string, string]> {
   return [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
-function uploadPackCapsV0(forge: Forge, repo: Repo): string {
+function uploadCapsV0(forge: Forge, repo: Repo): string {
   return [
     'multi_ack_detailed',
     'side-band-64k',
@@ -311,34 +319,34 @@ function uploadPackCapsV0(forge: Forge, repo: Repo): string {
   ].join(' ');
 }
 
-function receivePackCaps(forge: Forge, repo: Repo): string {
+function receiveCaps(forge: Forge, repo: Repo): string {
   return ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', `agent=${AGENT}`, `symref=HEAD:${forge.headRef(repo)}`].join(' ');
 }
 
 /** Ref lines for a v0 advertisement: HEAD first (carrying the capabilities), then refs with peels. */
-function v0RefLines(forge: Forge, repo: Repo, caps: string): Buffer[] {
-  const headRef = forge.headRef(repo);
-  const headOid = repo.refs.get(headRef);
-  const lines: Buffer[] = [];
+function v0RefLines(forge: Forge, repo: Repo, capText: string): Buffer[] {
+  const headName = forge.headRef(repo);
+  const headOid = repo.refs.get(headName);
+  const outLines: Buffer[] = [];
   if (headOid === undefined && repo.refs.size === 0) {
-    lines.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-    return lines;
+    outLines.push(pktLine(`${ZERO_OID} capabilities^{}\0${capText}\n`));
+    return outLines;
   }
   if (headOid !== undefined) {
-    lines.push(pktLine(`${headOid} HEAD\0${caps}\n`));
+    outLines.push(pktLine(`${headOid} HEAD\0${capText}\n`));
   } else {
-    const first = sortedRefs(repo)[0];
-    if (first !== undefined) lines.push(pktLine(`${first[1]} ${first[0]}\0${caps}\n`));
+    const firstRef = refsInOrder(repo)[0];
+    if (firstRef !== undefined) outLines.push(pktLine(`${firstRef[1]} ${firstRef[0]}\0${capText}\n`));
   }
-  for (const [ref, oid] of sortedRefs(repo)) {
-    if (headOid === undefined && lines.length === 1 && ref === sortedRefs(repo)[0]![0]) continue;
-    lines.push(pktLine(`${oid} ${ref}\n`));
-    if (ref.startsWith('refs/tags/')) {
-      const peeled = forge.peelToCommit(oid);
-      if (peeled !== null && peeled !== oid) lines.push(pktLine(`${peeled} ${ref}^{}\n`));
+  for (const [refName, oidHex] of refsInOrder(repo)) {
+    if (headOid === undefined && outLines.length === 1 && refName === refsInOrder(repo)[0]![0]) continue;
+    outLines.push(pktLine(`${oidHex} ${refName}\n`));
+    if (refName.startsWith('refs/tags/')) {
+      const peeledOid = forge.peelToCommit(oidHex);
+      if (peeledOid !== null && peeledOid !== oidHex) outLines.push(pktLine(`${peeledOid} ${refName}^{}\n`));
     }
   }
-  return lines;
+  return outLines;
 }
 
 /** The v2 capability advertisement: fixed lines, no per-repo data — built once for the process. */
@@ -351,50 +359,50 @@ const V2_ADVERTISEMENT: Buffer = Buffer.concat([
   PKT_FLUSH,
 ]);
 
-function infoRefs(forge: Forge, res: HttpResponse, repo: Repo, service: string, protocolHeader: string | undefined): void {
-  const isUpload = service === 'git-upload-pack';
-  const wantsV2 = isUpload && protocolHeader !== undefined && protocolHeader.includes('version=2');
-  if (wantsV2) {
+function infoRefs(forge: Forge, res: HttpResponse, repo: Repo, serviceName: string, protocolValue: string | undefined): void {
+  const forUpload = serviceName === 'git-upload-pack';
+  const useV2 = forUpload && protocolValue !== undefined && protocolValue.includes('version=2');
+  if (useV2) {
     return sendBytes(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
   }
-  const preamble = pktLine(`# service=${service}\n`);
-  const caps = isUpload ? uploadPackCapsV0(forge, repo) : receivePackCaps(forge, repo);
-  const body = Buffer.concat([preamble, PKT_FLUSH, ...v0RefLines(forge, repo, caps), PKT_FLUSH]);
-  return sendBytes(res, 200, body, isUpload ? 'application/x-git-upload-pack-advertisement' : 'application/x-git-receive-pack-advertisement');
+  const banner = pktLine(`# service=${serviceName}\n`);
+  const capText = forUpload ? uploadCapsV0(forge, repo) : receiveCaps(forge, repo);
+  const payload = Buffer.concat([banner, PKT_FLUSH, ...v0RefLines(forge, repo, capText), PKT_FLUSH]);
+  return sendBytes(res, 200, payload, forUpload ? 'application/x-git-upload-pack-advertisement' : 'application/x-git-receive-pack-advertisement');
 }
 
 // ---------------------------------------------------------------------------------------------
 // answer caches (fetch and ls-refs)
 // ---------------------------------------------------------------------------------------------
 
-const ANSWER_CACHE_LIMIT = 512;
-const answerCaches = new WeakMap<Forge, Map<string, Buffer>>();
+const ANSWER_CACHE_MAX = 512;
+const cachesByForge = new WeakMap<Forge, Map<string, Buffer>>();
 
-function answerCache(forge: Forge): Map<string, Buffer> {
-  let cache = answerCaches.get(forge);
-  if (cache === undefined) {
-    cache = new Map();
-    answerCaches.set(forge, cache);
+function cacheFor(forge: Forge): Map<string, Buffer> {
+  let store = cachesByForge.get(forge);
+  if (store === undefined) {
+    store = new Map();
+    cachesByForge.set(forge, store);
   }
-  return cache;
+  return store;
 }
 
-function cacheAnswer(forge: Forge, key: string, body: Buffer): void {
-  const cache = answerCache(forge);
-  if (cache.size >= ANSWER_CACHE_LIMIT) cache.clear();
-  cache.set(key, body);
+function storeAnswer(forge: Forge, key: string, body: Buffer): void {
+  const store = cacheFor(forge);
+  if (store.size >= ANSWER_CACHE_MAX) store.clear();
+  store.set(key, body);
 }
 
 /** A fingerprint of everything outside a request's own fields that an answer may depend on. */
-function storeFingerprint(forge: Forge, repo: Repo): string {
-  const refs = sortedRefs(repo)
-    .map(([ref, oid]) => `${ref}=${oid}`)
+function stateFingerprint(forge: Forge, repo: Repo): string {
+  const refList = refsInOrder(repo)
+    .map(([refName, oidHex]) => `${refName}=${oidHex}`)
     .join(',');
-  return `${forge.objects.size}|${forge.headRef(repo)}|${refs}`;
+  return `${forge.objects.size}|${forge.headRef(repo)}|${refList}`;
 }
 
-function answerKey(forge: Forge, repo: Repo, parts: readonly string[]): string {
-  return createHash('sha1').update(parts.join('\n')).update('\n').update(storeFingerprint(forge, repo)).digest('hex');
+function makeAnswerKey(forge: Forge, repo: Repo, keyParts: readonly string[]): string {
+  return createHash('sha1').update(keyParts.join('\n')).update('\n').update(stateFingerprint(forge, repo)).digest('hex');
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -402,46 +410,46 @@ function answerKey(forge: Forge, repo: Repo, parts: readonly string[]): string {
 // ---------------------------------------------------------------------------------------------
 
 function lsRefs(forge: Forge, res: HttpResponse, repo: Repo, packets: Packet[]): void {
-  let peel = false;
-  let symrefs = false;
-  let unborn = false;
-  const prefixes: string[] = [];
-  for (const packet of packets) {
-    if (packet.kind !== 'data') continue;
-    const line = packet.payload.toString('utf8').replace(/\n$/, '');
-    if (line === 'peel') peel = true;
-    else if (line === 'symrefs') symrefs = true;
-    else if (line === 'unborn') unborn = true;
-    else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
+  let wantPeel = false;
+  let wantSymrefs = false;
+  let wantUnborn = false;
+  const refPrefixes: string[] = [];
+  for (const frame of packets) {
+    if (frame.kind !== 'data') continue;
+    const lineText = frame.payload.toString('utf8').replace(/\n$/, '');
+    if (lineText === 'peel') wantPeel = true;
+    else if (lineText === 'symrefs') wantSymrefs = true;
+    else if (lineText === 'unborn') wantUnborn = true;
+    else if (lineText.startsWith('ref-prefix ')) refPrefixes.push(lineText.slice('ref-prefix '.length));
   }
-  const key = answerKey(forge, repo, ['ls-refs', String(peel), String(symrefs), String(unborn), ...prefixes]);
-  const cached = answerCache(forge).get(key);
-  if (cached !== undefined) {
-    return sendBytes(res, 200, cached, 'application/x-git-upload-pack-result');
+  const cacheId = makeAnswerKey(forge, repo, ['ls-refs', String(wantPeel), String(wantSymrefs), String(wantUnborn), ...refPrefixes]);
+  const hit = cacheFor(forge).get(cacheId);
+  if (hit !== undefined) {
+    return sendBytes(res, 200, hit, 'application/x-git-upload-pack-result');
   }
-  const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
-  const lines: Buffer[] = [];
-  const headRef = forge.headRef(repo);
-  const headOid = repo.refs.get(headRef);
-  if (matches('HEAD')) {
+  const nameMatches = (name: string): boolean => refPrefixes.length === 0 || refPrefixes.some((prefix) => name.startsWith(prefix));
+  const outLines: Buffer[] = [];
+  const headName = forge.headRef(repo);
+  const headOid = repo.refs.get(headName);
+  if (nameMatches('HEAD')) {
     if (headOid !== undefined) {
-      lines.push(pktLine(`${headOid} HEAD${symrefs ? ` symref-target:${headRef}` : ''}\n`));
-    } else if (unborn) {
-      lines.push(pktLine(`unborn HEAD${symrefs ? ` symref-target:${headRef}` : ''}\n`));
+      outLines.push(pktLine(`${headOid} HEAD${wantSymrefs ? ` symref-target:${headName}` : ''}\n`));
+    } else if (wantUnborn) {
+      outLines.push(pktLine(`unborn HEAD${wantSymrefs ? ` symref-target:${headName}` : ''}\n`));
     }
   }
-  for (const [ref, oid] of sortedRefs(repo)) {
-    if (!matches(ref)) continue;
-    let suffix = '';
-    if (peel && ref.startsWith('refs/tags/')) {
-      const peeled = forge.peelToCommit(oid);
-      if (peeled !== null && peeled !== oid) suffix = ` peeled:${peeled}`;
+  for (const [refName, oidHex] of refsInOrder(repo)) {
+    if (!nameMatches(refName)) continue;
+    let peelSuffix = '';
+    if (wantPeel && refName.startsWith('refs/tags/')) {
+      const peeledOid = forge.peelToCommit(oidHex);
+      if (peeledOid !== null && peeledOid !== oidHex) peelSuffix = ` peeled:${peeledOid}`;
     }
-    lines.push(pktLine(`${oid} ${ref}${suffix}\n`));
+    outLines.push(pktLine(`${oidHex} ${refName}${peelSuffix}\n`));
   }
-  const body = Buffer.concat([...lines, PKT_FLUSH]);
-  cacheAnswer(forge, key, body);
-  return sendBytes(res, 200, body, 'application/x-git-upload-pack-result');
+  const payload = Buffer.concat([...outLines, PKT_FLUSH]);
+  storeAnswer(forge, cacheId, payload);
+  return sendBytes(res, 200, payload, 'application/x-git-upload-pack-result');
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -450,223 +458,224 @@ function lsRefs(forge: Forge, res: HttpResponse, repo: Repo, packets: Packet[]):
 
 interface FetchPlan {
   /** Objects to put in the pack. */
-  send: GitObj[];
+  objects: GitObj[];
   /** Commits to report as the (new) shallow boundary. */
-  shallow: string[];
+  shallowTips: string[];
   /** Commits to report as no longer shallow. */
-  unshallow: string[];
+  lifted: string[];
 }
 
 /**
- * Work out what a fetch transfers. Commit distance is measured from the wants (through tags);
- * `depth` bounds it. Exclusion is depth-aware for shallow clients: a have the client holds as a
- * shallow boundary excludes only itself and its trees, never its parents.
+ * Work out what a fetch transfers. Commit distance is measured from the
+ * wants (through tags); `depthLimit` bounds it. Exclusion is depth-aware
+ * for shallow clients: a have the client holds as a shallow boundary
+ * excludes only itself and its trees, never its parents.
  */
-function planFetch(forge: Forge, wants: string[], haves: string[], clientShallow: ReadonlySet<string>, depth: number | null): FetchPlan {
-  const included = new Set<string>();
-  const commitLevel = new Map<string, number>();
+function planFetch(forge: Forge, wantOids: string[], haveOids: string[], shallowSet: ReadonlySet<string>, depthLimit: number | null): FetchPlan {
+  const chosen = new Set<string>();
+  const levelOf = new Map<string, number>();
   // Breadth-first by commit level; tags and trees ride along with their commit.
-  const includeTree = (treeOid: string): void => {
-    const stack = [treeOid];
-    while (stack.length > 0) {
-      const oid = stack.pop()!;
-      if (included.has(oid)) continue;
-      const object = forge.getObject(oid);
-      if (object === undefined) continue;
-      included.add(oid);
-      if (object.type === 'tree') {
-        for (const entry of parseTreeEntries(forge, oid)) stack.push(entry.oid);
+  const includeTreeOf = (treeOid: string): void => {
+    const pending = [treeOid];
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      if (chosen.has(current)) continue;
+      const obj = forge.getObject(current);
+      if (obj === undefined) continue;
+      chosen.add(current);
+      if (obj.type === 'tree') {
+        for (const row of treeEntryOids(forge, current)) pending.push(row.oid);
       }
     }
   };
-  const queue: Array<{ oid: string; level: number }> = [];
-  for (const want of wants) queue.push({ oid: want, level: 0 });
-  while (queue.length > 0) {
-    const { oid, level } = queue.shift()!;
-    const object = forge.getObject(oid);
-    if (object === undefined) continue;
-    if (object.type === 'tag') {
-      included.add(oid);
-      queue.push({ oid: parseTag(object.data).object, level });
+  const frontier: Array<{ oid: string; level: number }> = [];
+  for (const wantOid of wantOids) frontier.push({ oid: wantOid, level: 0 });
+  while (frontier.length > 0) {
+    const { oid: current, level } = frontier.shift()!;
+    const obj = forge.getObject(current);
+    if (obj === undefined) continue;
+    if (obj.type === 'tag') {
+      chosen.add(current);
+      frontier.push({ oid: parseTag(obj.data).object, level });
       continue;
     }
-    if (object.type !== 'commit') continue;
-    const known = commitLevel.get(oid);
-    if (known !== undefined && known <= level) continue;
-    commitLevel.set(oid, level);
-    if (depth !== null && level >= depth) continue;
-    included.add(oid);
-    const commit = parseCommit(object.data);
-    includeTree(commit.tree);
-    for (const parent of commit.parents) queue.push({ oid: parent, level: level + 1 });
+    if (obj.type !== 'commit') continue;
+    const priorLevel = levelOf.get(current);
+    if (priorLevel !== undefined && priorLevel <= level) continue;
+    levelOf.set(current, level);
+    if (depthLimit !== null && level >= depthLimit) continue;
+    chosen.add(current);
+    const info = parseCommit(obj.data);
+    includeTreeOf(info.tree);
+    for (const parentOid of info.parents) frontier.push({ oid: parentOid, level: level + 1 });
   }
   // Shallow boundary: included commits with a parent that is not included.
-  const shallow: string[] = [];
-  if (depth !== null) {
-    for (const oid of included) {
-      const object = forge.getObject(oid)!;
-      if (object.type !== 'commit') continue;
-      const parents = parseCommit(object.data).parents;
-      if (parents.some((parent) => !included.has(parent))) shallow.push(oid);
+  const boundary: string[] = [];
+  if (depthLimit !== null) {
+    for (const oidHex of chosen) {
+      const obj = forge.getObject(oidHex)!;
+      if (obj.type !== 'commit') continue;
+      const parentOids = parseCommit(obj.data).parents;
+      if (parentOids.some((parentOid) => !chosen.has(parentOid))) boundary.push(oidHex);
     }
   }
   // Exclusions.
-  const excluded = new Set<string>();
-  for (const have of haves) {
-    if (depth !== null && clientShallow.has(have)) {
-      excluded.add(have);
-      const object = forge.getObject(have);
-      if (object !== undefined && object.type === 'commit') {
-        const stack = [parseCommit(object.data).tree];
-        while (stack.length > 0) {
-          const oid = stack.pop()!;
-          if (excluded.has(oid)) continue;
-          const entry = forge.getObject(oid);
-          if (entry === undefined) continue;
-          excluded.add(oid);
-          if (entry.type === 'tree') for (const child of parseTreeEntries(forge, oid)) stack.push(child.oid);
+  const withheld = new Set<string>();
+  for (const haveOid of haveOids) {
+    if (depthLimit !== null && shallowSet.has(haveOid)) {
+      withheld.add(haveOid);
+      const obj = forge.getObject(haveOid);
+      if (obj !== undefined && obj.type === 'commit') {
+        const pending = [parseCommit(obj.data).tree];
+        while (pending.length > 0) {
+          const current = pending.pop()!;
+          if (withheld.has(current)) continue;
+          const nodeObj = forge.getObject(current);
+          if (nodeObj === undefined) continue;
+          withheld.add(current);
+          if (nodeObj.type === 'tree') for (const childRow of treeEntryOids(forge, current)) pending.push(childRow.oid);
         }
       }
     } else {
-      for (const oid of forge.reachable([have])) excluded.add(oid);
+      for (const oidHex of forge.reachable([haveOid])) withheld.add(oidHex);
     }
   }
-  const unshallow: string[] = [];
-  if (depth !== null) {
-    for (const oid of clientShallow) {
-      if (included.has(oid) && !shallow.includes(oid)) unshallow.push(oid);
+  const lifted: string[] = [];
+  if (depthLimit !== null) {
+    for (const oidHex of shallowSet) {
+      if (chosen.has(oidHex) && !boundary.includes(oidHex)) lifted.push(oidHex);
     }
   }
-  const send: GitObj[] = [];
-  for (const oid of included) {
-    if (excluded.has(oid)) continue;
-    const object = forge.getObject(oid);
-    if (object !== undefined) send.push(object);
+  const objects: GitObj[] = [];
+  for (const oidHex of chosen) {
+    if (withheld.has(oidHex)) continue;
+    const obj = forge.getObject(oidHex);
+    if (obj !== undefined) objects.push(obj);
   }
-  return { send, shallow, unshallow };
+  return { objects, shallowTips: boundary, lifted };
 }
 
-function parseTreeEntries(forge: Forge, treeOid: string): Array<{ oid: string }> {
-  const object = forge.getObject(treeOid);
-  if (object === undefined || object.type !== 'tree') return [];
+function treeEntryOids(forge: Forge, treeOid: string): Array<{ oid: string }> {
+  const obj = forge.getObject(treeOid);
+  if (obj === undefined || obj.type !== 'tree') return [];
   // Local import indirection avoided: parse entries inline via store's parser.
-  return parseTreeData(object.data);
+  return scanTreeOids(obj.data);
 }
 
-function parseTreeData(data: Buffer): Array<{ oid: string }> {
-  const entries: Array<{ oid: string }> = [];
-  let offset = 0;
-  while (offset < data.length) {
-    const space = data.indexOf(0x20, offset);
-    const nul = data.indexOf(0x00, space);
-    entries.push({ oid: data.toString('hex', nul + 1, nul + 21) });
-    offset = nul + 21;
+function scanTreeOids(data: Buffer): Array<{ oid: string }> {
+  const rows: Array<{ oid: string }> = [];
+  let pos = 0;
+  while (pos < data.length) {
+    const spaceAt = data.indexOf(0x20, pos);
+    const nulAt = data.indexOf(0x00, spaceAt);
+    rows.push({ oid: data.toString('hex', nulAt + 1, nulAt + 21) });
+    pos = nulAt + 21;
   }
-  return entries;
+  return rows;
 }
 
 /** Frame pack bytes as sideband-64k packets (band 1), with one band-2 progress note first. */
-function sidebandPackets(pack: Buffer): Buffer[] {
-  const packets: Buffer[] = [pktLine(Buffer.concat([Buffer.from([2]), Buffer.from('forge: sending objects\n', 'utf8')]))];
-  const CHUNK = 32_000;
-  for (let offset = 0; offset < pack.length; offset += CHUNK) {
-    packets.push(pktLine(Buffer.concat([Buffer.from([1]), pack.subarray(offset, offset + CHUNK)])));
+function sidebandPackets(packBytes: Buffer): Buffer[] {
+  const frames: Buffer[] = [pktLine(Buffer.concat([Buffer.from([2]), Buffer.from('forge: sending objects\n', 'utf8')]))];
+  const CHUNK_SIZE = 32_000;
+  for (let pos = 0; pos < packBytes.length; pos += CHUNK_SIZE) {
+    frames.push(pktLine(Buffer.concat([Buffer.from([1]), packBytes.subarray(pos, pos + CHUNK_SIZE)])));
   }
-  if (pack.length === 0) packets.push(pktLine(Buffer.from([1])));
-  return packets;
+  if (packBytes.length === 0) frames.push(pktLine(Buffer.from([1])));
+  return frames;
 }
 
 interface FetchAsk {
-  wants: string[];
-  haves: string[];
-  clientShallow: Set<string>;
-  depth: number | null;
+  wantOids: string[];
+  haveOids: string[];
+  shallowSet: Set<string>;
+  depthLimit: number | null;
 }
 
 /** Parse the ask lines shared by the v0 and v2 fetch commands. */
 function parseFetchAsk(packets: Packet[], v2: boolean): FetchAsk {
-  const wants: string[] = [];
-  const haves: string[] = [];
-  const clientShallow = new Set<string>();
-  let depth: number | null = null;
-  for (const packet of packets) {
-    if (packet.kind !== 'data') continue;
-    const line = packet.payload.toString('utf8').replace(/\n$/, '');
-    if (line.startsWith('want ')) wants.push(v2 ? line.slice(5).trim() : line.slice(5).trim().split(' ')[0]!);
-    else if (line.startsWith('have ')) haves.push(line.slice(5).trim());
-    else if (line.startsWith('shallow ')) clientShallow.add(line.slice(8).trim());
-    else if (line.startsWith('deepen ')) depth = Number.parseInt(line.slice(7).trim(), 10);
+  const wantOids: string[] = [];
+  const haveOids: string[] = [];
+  const shallowSet = new Set<string>();
+  let depthLimit: number | null = null;
+  for (const frame of packets) {
+    if (frame.kind !== 'data') continue;
+    const lineText = frame.payload.toString('utf8').replace(/\n$/, '');
+    if (lineText.startsWith('want ')) wantOids.push(v2 ? lineText.slice(5).trim() : lineText.slice(5).trim().split(' ')[0]!);
+    else if (lineText.startsWith('have ')) haveOids.push(lineText.slice(5).trim());
+    else if (lineText.startsWith('shallow ')) shallowSet.add(lineText.slice(8).trim());
+    else if (lineText.startsWith('deepen ')) depthLimit = Number.parseInt(lineText.slice(7).trim(), 10);
   }
-  return { wants, haves, clientShallow, depth };
+  return { wantOids, haveOids, shallowSet, depthLimit };
 }
 
-function fetchKey(forge: Forge, repo: Repo, flavour: string, ask: FetchAsk): string {
-  return answerKey(forge, repo, [
-    flavour,
-    `w:${[...ask.wants].sort().join(',')}`,
-    `h:${[...ask.haves].sort().join(',')}`,
-    `s:${[...ask.clientShallow].sort().join(',')}`,
-    `d:${ask.depth === null ? '' : ask.depth}`,
+function fetchKey(forge: Forge, repo: Repo, variant: string, ask: FetchAsk): string {
+  return makeAnswerKey(forge, repo, [
+    variant,
+    `w:${[...ask.wantOids].sort().join(',')}`,
+    `h:${[...ask.haveOids].sort().join(',')}`,
+    `s:${[...ask.shallowSet].sort().join(',')}`,
+    `d:${ask.depthLimit === null ? '' : ask.depthLimit}`,
   ]);
 }
 
 function fetchV2(forge: Forge, res: HttpResponse, repo: Repo, packets: Packet[]): void {
-  const ask = parseFetchAsk(packets, true);
-  const key = fetchKey(forge, repo, 'fetch-v2', ask);
-  const cached = answerCache(forge).get(key);
-  if (cached !== undefined) {
-    return sendBytes(res, 200, cached, 'application/x-git-upload-pack-result');
+  const request = parseFetchAsk(packets, true);
+  const cacheId = fetchKey(forge, repo, 'fetch-v2', request);
+  const hit = cacheFor(forge).get(cacheId);
+  if (hit !== undefined) {
+    return sendBytes(res, 200, hit, 'application/x-git-upload-pack-result');
   }
-  const plan = planFetch(forge, ask.wants, ask.haves, ask.clientShallow, ask.depth);
-  const pack = writePack(plan.send);
-  const parts: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_FLUSH];
-  if (ask.depth !== null) {
-    parts.push(pktLine('shallow-info\n'));
-    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-    parts.push(PKT_FLUSH);
+  const planResult = planFetch(forge, request.wantOids, request.haveOids, request.shallowSet, request.depthLimit);
+  const packBytes = writePack(planResult.objects);
+  const sections: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), PKT_FLUSH];
+  if (request.depthLimit !== null) {
+    sections.push(pktLine('shallow-info\n'));
+    for (const oidHex of planResult.shallowTips) sections.push(pktLine(`shallow ${oidHex}\n`));
+    for (const oidHex of planResult.lifted) sections.push(pktLine(`unshallow ${oidHex}\n`));
+    sections.push(PKT_FLUSH);
   }
-  parts.push(pktLine('packfile\n'), ...sidebandPackets(pack), PKT_FLUSH);
-  const body = Buffer.concat(parts);
-  cacheAnswer(forge, key, body);
-  return sendBytes(res, 200, body, 'application/x-git-upload-pack-result');
+  sections.push(pktLine('packfile\n'), ...sidebandPackets(packBytes), PKT_FLUSH);
+  const payload = Buffer.concat(sections);
+  storeAnswer(forge, cacheId, payload);
+  return sendBytes(res, 200, payload, 'application/x-git-upload-pack-result');
 }
 
 function fetchV0(forge: Forge, res: HttpResponse, repo: Repo, packets: Packet[]): void {
-  const ask = parseFetchAsk(packets, false);
-  const key = fetchKey(forge, repo, 'fetch-v0', ask);
-  const cached = answerCache(forge).get(key);
-  if (cached !== undefined) {
-    return sendBytes(res, 200, cached, 'application/x-git-upload-pack-result');
+  const request = parseFetchAsk(packets, false);
+  const cacheId = fetchKey(forge, repo, 'fetch-v0', request);
+  const hit = cacheFor(forge).get(cacheId);
+  if (hit !== undefined) {
+    return sendBytes(res, 200, hit, 'application/x-git-upload-pack-result');
   }
-  const plan = planFetch(forge, ask.wants, ask.haves, ask.clientShallow, ask.depth);
-  const pack = writePack(plan.send);
-  const parts: Buffer[] = [];
-  if (ask.depth !== null) {
-    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+  const planResult = planFetch(forge, request.wantOids, request.haveOids, request.shallowSet, request.depthLimit);
+  const packBytes = writePack(planResult.objects);
+  const sections: Buffer[] = [];
+  if (request.depthLimit !== null) {
+    for (const oidHex of planResult.shallowTips) sections.push(pktLine(`shallow ${oidHex}\n`));
+    for (const oidHex of planResult.lifted) sections.push(pktLine(`unshallow ${oidHex}\n`));
   }
-  parts.push(pktLine('NAK\n'), ...sidebandPackets(pack), PKT_FLUSH);
-  const body = Buffer.concat(parts);
-  cacheAnswer(forge, key, body);
-  return sendBytes(res, 200, body, 'application/x-git-upload-pack-result');
+  sections.push(pktLine('NAK\n'), ...sidebandPackets(packBytes), PKT_FLUSH);
+  const payload = Buffer.concat(sections);
+  storeAnswer(forge, cacheId, payload);
+  return sendBytes(res, 200, payload, 'application/x-git-upload-pack-result');
 }
 
 async function uploadPack(forge: Forge, req: HttpRequest, res: HttpResponse, repo: Repo): Promise<void> {
-  const body = await readBody(req);
-  const { packets } = decodePackets(body);
-  const first = packets.find((packet) => packet.kind === 'data');
-  const firstLine = first === undefined ? '' : first.payload.toString('utf8');
-  if (firstLine.startsWith('command=ls-refs')) {
+  const rawBody = await readBody(req);
+  const { packets: frames } = decodePackets(rawBody);
+  const leadFrame = frames.find((frame) => frame.kind === 'data');
+  const leadLine = leadFrame === undefined ? '' : leadFrame.payload.toString('utf8');
+  if (leadLine.startsWith('command=ls-refs')) {
     // The ls-refs arguments follow the delim packet.
-    const delimIndex = packets.findIndex((packet) => packet.kind === 'delim');
-    return lsRefs(forge, res, repo, delimIndex === -1 ? packets : packets.slice(delimIndex + 1));
+    const delimAt = frames.findIndex((frame) => frame.kind === 'delim');
+    return lsRefs(forge, res, repo, delimAt === -1 ? frames : frames.slice(delimAt + 1));
   }
-  if (firstLine.startsWith('command=fetch')) {
-    const delimIndex = packets.findIndex((packet) => packet.kind === 'delim');
-    return fetchV2(forge, res, repo, delimIndex === -1 ? packets : packets.slice(delimIndex + 1));
+  if (leadLine.startsWith('command=fetch')) {
+    const delimAt = frames.findIndex((frame) => frame.kind === 'delim');
+    return fetchV2(forge, res, repo, delimAt === -1 ? frames : frames.slice(delimAt + 1));
   }
-  return fetchV0(forge, res, repo, packets);
+  return fetchV0(forge, res, repo, frames);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -674,71 +683,71 @@ async function uploadPack(forge: Forge, req: HttpRequest, res: HttpResponse, rep
 // ---------------------------------------------------------------------------------------------
 
 interface PushCommand {
-  oldOid: string;
-  newOid: string;
-  ref: string;
+  beforeOid: string;
+  afterOid: string;
+  refName: string;
 }
 
 async function receivePack(forge: Forge, req: HttpRequest, res: HttpResponse, repo: Repo): Promise<void> {
-  const body = await readBody(req);
-  const { packets, rest } = decodePackets(body);
-  const commands: PushCommand[] = [];
-  for (const packet of packets) {
-    if (packet.kind === 'flush') break;
-    if (packet.kind !== 'data') continue;
-    let line = packet.payload.toString('utf8').replace(/\n$/, '');
-    const nul = line.indexOf('\0');
-    if (nul !== -1) line = line.slice(0, nul);
-    const parts = line.split(' ');
-    if (parts.length >= 3) commands.push({ oldOid: parts[0]!, newOid: parts[1]!, ref: parts.slice(2).join(' ') });
+  const rawBody = await readBody(req);
+  const { packets: frames, rest: restBytes } = decodePackets(rawBody);
+  const pushCmds: PushCommand[] = [];
+  for (const frame of frames) {
+    if (frame.kind === 'flush') break;
+    if (frame.kind !== 'data') continue;
+    let lineText = frame.payload.toString('utf8').replace(/\n$/, '');
+    const nulAt = lineText.indexOf('\0');
+    if (nulAt !== -1) lineText = lineText.slice(0, nulAt);
+    const fields = lineText.split(' ');
+    if (fields.length >= 3) pushCmds.push({ beforeOid: fields[0]!, afterOid: fields[1]!, refName: fields.slice(2).join(' ') });
   }
-  let unpackOk = true;
-  let unpackDetail = '';
-  const hasPack = commands.some((command) => command.newOid !== ZERO_OID);
-  if (hasPack && rest.length > 0) {
+  let unpacked = true;
+  let unpackProblem = '';
+  const packPresent = pushCmds.some((cmd) => cmd.afterOid !== ZERO_OID);
+  if (packPresent && restBytes.length > 0) {
     try {
-      readPackInto(forge, rest);
+      readPackInto(forge, restBytes);
     } catch (err) {
-      unpackOk = false;
-      unpackDetail = err instanceof Error ? err.message : String(err);
+      unpacked = false;
+      unpackProblem = err instanceof Error ? err.message : String(err);
     }
   }
-  const reportLines: string[] = [unpackOk ? 'unpack ok' : `unpack ${unpackDetail || 'error'}`];
-  for (const command of commands) {
-    if (!unpackOk) {
-      reportLines.push(`ng ${command.ref} unpack failed`);
+  const report: string[] = [unpacked ? 'unpack ok' : `unpack ${unpackProblem || 'error'}`];
+  for (const cmd of pushCmds) {
+    if (!unpacked) {
+      report.push(`ng ${cmd.refName} unpack failed`);
       continue;
     }
-    const problem = applyPushCommand(forge, repo, command);
-    reportLines.push(problem === null ? `ok ${command.ref}` : `ng ${command.ref} ${problem}`);
+    const problem = applyPushCommand(forge, repo, cmd);
+    report.push(problem === null ? `ok ${cmd.refName}` : `ng ${cmd.refName} ${problem}`);
   }
   // The report is a pkt-line stream carried inside sideband band 1.
-  const parts: Buffer[] = [pktLine(Buffer.concat([Buffer.from([2]), Buffer.from('forge: unpacking\n', 'utf8')]))];
-  for (const line of reportLines) {
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), pktLine(`${line}\n`)])));
+  const bandFrames: Buffer[] = [pktLine(Buffer.concat([Buffer.from([2]), Buffer.from('forge: unpacking\n', 'utf8')]))];
+  for (const lineText of report) {
+    bandFrames.push(pktLine(Buffer.concat([Buffer.from([1]), pktLine(`${lineText}\n`)])));
   }
-  parts.push(pktLine(Buffer.concat([Buffer.from([1]), PKT_FLUSH])), PKT_FLUSH);
-  return sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-receive-pack-result');
+  bandFrames.push(pktLine(Buffer.concat([Buffer.from([1]), PKT_FLUSH])), PKT_FLUSH);
+  return sendBytes(res, 200, Buffer.concat(bandFrames), 'application/x-git-receive-pack-result');
 }
 
 /** Validate and apply one push command; a problem string refuses just this ref. */
-function applyPushCommand(forge: Forge, repo: Repo, command: PushCommand): string | null {
-  const current = repo.refs.get(command.ref) ?? ZERO_OID;
-  if (command.newOid === ZERO_OID) {
-    repo.refs.delete(command.ref);
+function applyPushCommand(forge: Forge, repo: Repo, cmd: PushCommand): string | null {
+  const currentOid = repo.refs.get(cmd.refName) ?? ZERO_OID;
+  if (cmd.afterOid === ZERO_OID) {
+    repo.refs.delete(cmd.refName);
     return null;
   }
-  const target = forge.getObject(command.newOid);
-  if (target === undefined) return 'object not found';
-  if (command.ref.startsWith('refs/heads/')) {
-    const commit = forge.peelToCommit(command.newOid);
-    if (commit === null) return 'object is not a commit';
-    if (current !== ZERO_OID && command.oldOid !== ZERO_OID) {
-      const currentCommit = forge.peelToCommit(current);
-      if (currentCommit !== null && !forge.isAncestor(currentCommit, commit)) return 'non-fast-forward';
+  const targetObj = forge.getObject(cmd.afterOid);
+  if (targetObj === undefined) return 'object not found';
+  if (cmd.refName.startsWith('refs/heads/')) {
+    const commitOid = forge.peelToCommit(cmd.afterOid);
+    if (commitOid === null) return 'object is not a commit';
+    if (currentOid !== ZERO_OID && cmd.beforeOid !== ZERO_OID) {
+      const currentTip = forge.peelToCommit(currentOid);
+      if (currentTip !== null && !forge.isAncestor(currentTip, commitOid)) return 'non-fast-forward';
     }
   }
-  repo.refs.set(command.ref, command.newOid);
+  repo.refs.set(cmd.refName, cmd.afterOid);
   return null;
 }
 
@@ -752,39 +761,39 @@ function applyPushCommand(forge: Forge, repo: Repo, command: PushCommand): strin
  */
 export async function handleGit(forge: Forge, req: HttpRequest, res: HttpResponse, url: URL, segments: string[]): Promise<boolean> {
   if (segments.length < 3) return false;
-  const owner = segments[0]!;
-  const repoSegment = segments[1]!;
-  if (!repoSegment.endsWith('.git')) return false;
-  const name = repoSegment.slice(0, -4);
-  const tail = segments.slice(2);
+  const ownerName = segments[0]!;
+  const repoSeg = segments[1]!;
+  if (!repoSeg.endsWith('.git')) return false;
+  const repoName = repoSeg.slice(0, -4);
+  const tailSegs = segments.slice(2);
 
   if (!isAuthenticated(req)) {
     sendError(res, 401, 'Requires authentication');
     return true;
   }
-  const repo = forge.repos.get(name);
-  if (repo === undefined || !forge.ownerMatches(owner)) {
+  const foundRepo = forge.repos.get(repoName);
+  if (foundRepo === undefined || !forge.ownerMatches(ownerName)) {
     sendError(res, 404, 'Not Found');
     return true;
   }
-  forge.adoptLogin(owner);
+  forge.adoptLogin(ownerName);
 
-  const method = req.method ?? 'GET';
-  if (method === 'GET' && tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs') {
-    const service = url.searchParams.get('service') ?? '';
-    if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
+  const verb = req.method ?? 'GET';
+  if (verb === 'GET' && tailSegs.length === 2 && tailSegs[0] === 'info' && tailSegs[1] === 'refs') {
+    const serviceName = url.searchParams.get('service') ?? '';
+    if (serviceName !== 'git-upload-pack' && serviceName !== 'git-receive-pack') {
       sendError(res, 400, 'Unknown service');
       return true;
     }
-    infoRefs(forge, res, repo, service, req.headers['git-protocol']);
+    infoRefs(forge, res, foundRepo, serviceName, req.headers['git-protocol']);
     return true;
   }
-  if (method === 'POST' && tail.length === 1 && tail[0] === 'git-upload-pack') {
-    await uploadPack(forge, req, res, repo);
+  if (verb === 'POST' && tailSegs.length === 1 && tailSegs[0] === 'git-upload-pack') {
+    await uploadPack(forge, req, res, foundRepo);
     return true;
   }
-  if (method === 'POST' && tail.length === 1 && tail[0] === 'git-receive-pack') {
-    await receivePack(forge, req, res, repo);
+  if (verb === 'POST' && tailSegs.length === 1 && tailSegs[0] === 'git-receive-pack') {
+    await receivePack(forge, req, res, foundRepo);
     return true;
   }
   sendError(res, 404, 'Not Found');

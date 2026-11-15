@@ -1,100 +1,100 @@
-// Boot sequence for the forge, driven by the harness that runs beside it.
+// Entry point: the boot handshake between the forge and the harness beside it.
 //
-// The harness exposes one env service whose origin arrives in
-// MAKEFUN_ENV_URL. My job is only the handshake around the real server in
-// app.ts: bind a port the kernel chooses, tell the env which port that was,
-// wait until the env says the run is over, then close up and exit 0. Without
-// the env origin there is nobody to handshake with, so bail out at once.
+// The harness runs an env service and hands us its origin through
+// MAKEFUN_ENV_URL. Everything here is in service of that handshake: grab a
+// kernel-chosen port for the real server (app.ts), report the port back to
+// the env, then idle until the env declares the run finished, close down and
+// exit 0. With no env origin there is nobody to handshake with, so bail out
+// immediately.
 
 import { once } from 'node:events';
 import { createApp } from './app.ts';
 
-const envOrigin = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-if (envOrigin.length === 0) {
+const harnessBase = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+if (harnessBase.length === 0) {
   console.error('MAKEFUN_ENV_URL missing: no env to register with, exiting.');
   process.exit(1);
 }
 
-function pause(ms: number): Promise<void> {
+function waitMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Run an env call, retrying transient failures with a growing delay. The env
-// can be a breath behind us at boot, so the first attempts may be refused.
-async function withRetries<T>(call: () => Promise<T>, attempts: number): Promise<T> {
-  let wait = 120;
-  let failure: unknown = new Error('no attempt was made');
-  for (let n = 0; n < attempts; n += 1) {
+// Call the env, retrying through transient refusals with a growing gap: at
+// boot the env can lag a breath behind us, so early attempts may not land.
+async function retrying<T>(operation: () => Promise<T>, maxAttempts: number): Promise<T> {
+  let delayMs = 120;
+  let lastFailure: unknown = new Error('no attempt was made');
+  for (let attemptNo = 0; attemptNo < maxAttempts; attemptNo += 1) {
     try {
-      return await call();
+      return await operation();
     } catch (err) {
-      failure = err;
-      if (n + 1 < attempts) await pause(wait);
-      wait = Math.min(wait * 2, 1500);
+      lastFailure = err;
+      if (attemptNo + 1 < maxAttempts) await waitMs(delayMs);
+      delayMs = Math.min(delayMs * 2, 1500);
     }
   }
-  throw failure;
+  throw lastFailure;
 }
 
-async function tellEnvOurPort(port: number): Promise<void> {
-  const response = await fetch(envOrigin + '/register', {
+async function reportPortToEnv(boundPort: number): Promise<void> {
+  const reply = await fetch(harnessBase + '/register', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ port }),
+    body: JSON.stringify({ port: boundPort }),
   });
-  await response.text().catch(() => '');
-  // 409 means an earlier attempt already registered and the env keeps the
-  // first registration; that is the outcome we want, not a failure.
-  if (!response.ok && response.status !== 409) {
-    throw new Error('register replied with status ' + response.status);
+  await reply.text().catch(() => '');
+  // A 409 means an earlier attempt got there first and the env kept that
+  // registration — exactly the outcome we want, not an error.
+  if (!reply.ok && reply.status !== 409) {
+    throw new Error('register replied with status ' + reply.status);
   }
 }
 
-async function askEnvIfFinished(): Promise<boolean> {
-  const response = await fetch(envOrigin + '/done');
-  if (!response.ok) {
-    throw new Error('done replied with status ' + response.status);
+async function envSaysDone(): Promise<boolean> {
+  const reply = await fetch(harnessBase + '/done');
+  if (!reply.ok) {
+    throw new Error('done replied with status ' + reply.status);
   }
-  const payload = (await response.json()) as { done?: unknown };
-  return payload.done === true;
+  const body = (await reply.json()) as { done?: unknown };
+  return body.done === true;
 }
 
-const server = createApp();
-server.listen(0);
-await once(server, 'listening');
+const app = createApp();
+app.listen(0);
+await once(app, 'listening');
 
-const bound = server.address();
-if (bound === null || typeof bound !== 'object') {
+const addressInfo = app.address();
+if (addressInfo === null || typeof addressInfo !== 'object') {
   console.error('the server did not end up on a TCP port; exiting.');
   process.exit(1);
 }
 
-await withRetries(() => tellEnvOurPort(bound.port), 12);
+await retrying(() => reportPortToEnv(addressInfo.port), 12);
 
-// Poll until the env reports completion, stretching the pause a little
-// after each round so a long run does not hammer the env with requests. A
-// poll that errors counts as "not finished yet": leaving early would
-// forfeit the whole run.
-let finished = false;
-let pollPause = 200;
-while (!finished) {
+// Poll for the env's completion signal, stretching the gap a little after
+// each round so a long run does not hammer the env. A failed poll counts as
+// "not finished": walking away early would forfeit the whole run.
+let done = false;
+let pollGap = 200;
+while (!done) {
   try {
-    finished = await askEnvIfFinished();
+    done = await envSaysDone();
   } catch {
-    finished = false;
+    done = false;
   }
-  if (!finished) {
-    await pause(pollPause);
-    pollPause = Math.min(pollPause + 100, 1000);
+  if (!done) {
+    await waitMs(pollGap);
+    pollGap = Math.min(pollGap + 100, 1000);
   }
 }
 
-// Close, but do not let a client holding an idle keep-alive socket stall the
-// exit: the run is over either way, so cap the wait and leave regardless.
+// Close, but never let a client parked on an idle keep-alive socket stall
+// the exit: the run is over either way, so cap the wait and leave regardless.
 await Promise.race([
   new Promise<void>((resolve) => {
-    server.close(() => resolve());
+    app.close(() => resolve());
   }),
-  pause(3000),
+  waitMs(3000),
 ]);
 process.exit(0);

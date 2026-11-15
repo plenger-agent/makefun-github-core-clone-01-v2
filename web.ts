@@ -1,18 +1,20 @@
-// Small HTTP helpers shared by every surface (REST, GraphQL, MCP, git smart HTTP): JSON answers with
-// the discipline the protocol checks require (application/json, never HTML), request bodies read with
-// a generous cap, and the bearer-token check the whole forge shares. The req/res pair is the raw
-// transport's (server.ts), shaped like the node:http slice the helpers need.
+// Small HTTP helpers shared by every surface (REST, GraphQL, MCP, git smart
+// HTTP): JSON answers kept to the discipline the protocol checks require
+// (application/json, never HTML), request bodies read under a generous cap,
+// and the bearer-token check the whole forge shares. The req/res pair is the
+// raw transport's (server.ts), shaped like the node:http slice these helpers
+// need.
 
 import type { HttpRequest, HttpResponse } from './server.ts';
 
 export const JSON_TYPE = 'application/json; charset=utf-8';
-const MAX_BODY_BYTES = 256 * 1024 * 1024;
+const BODY_CAP_BYTES = 256 * 1024 * 1024;
 
 /** Answer with a JSON body; a trailing newline matches the starter's wire style. */
 export function sendJson(res: HttpResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+  const payloadText = `${JSON.stringify(body)}\n`;
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(payloadText), ...headers });
+  res.end(payloadText);
 }
 
 /** Answer with a bare status and no body (204 deletes, 202 notifications). */
@@ -35,18 +37,18 @@ export function sendError(res: HttpResponse, status: number, message: string): v
 /** Read a whole request body (bounded; git packs in the benchmark reach a few hundred KB). */
 export function readBody(req: HttpRequest): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
+    const pieces: Buffer[] = [];
+    let received = 0;
     req.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > MAX_BODY_BYTES) {
+      received += chunk.length;
+      if (received > BODY_CAP_BYTES) {
         reject(new Error('request body too large'));
         req.destroy();
         return;
       }
-      chunks.push(chunk);
+      pieces.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(Buffer.concat(pieces)));
     req.on('error', reject);
   });
 }
@@ -56,12 +58,12 @@ export function readBody(req: HttpRequest): Promise<Buffer> {
  * is not JSON is the protocol group's malformed-body case and answers { ok: false }.
  */
 export async function readJsonBody(req: HttpRequest): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false }> {
-  const raw = await readBody(req);
-  if (raw.length === 0) return { ok: true, value: {} };
+  const rawBytes = await readBody(req);
+  if (rawBytes.length === 0) return { ok: true, value: {} };
   try {
-    const value = JSON.parse(raw.toString('utf8')) as unknown;
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) return { ok: true, value: {} };
-    return { ok: true, value: value as Record<string, unknown> };
+    const parsed = JSON.parse(rawBytes.toString('utf8')) as unknown;
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: true, value: {} };
+    return { ok: true, value: parsed as Record<string, unknown> };
   } catch {
     return { ok: false };
   }
@@ -69,44 +71,44 @@ export async function readJsonBody(req: HttpRequest): Promise<{ ok: true; value:
 
 /** The bearer token a request presents, or null when it presents none. */
 export function bearerToken(req: HttpRequest): string | null {
-  const header = req.headers.authorization;
-  if (typeof header !== 'string') return null;
-  const match = /^Bearer (.+)$/.exec(header);
-  return match === null ? null : match[1]!;
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader !== 'string') return null;
+  const found = /^Bearer (.+)$/.exec(authHeader);
+  return found === null ? null : found[1]!;
 }
 
 /** Whether the request is authenticated: its bearer token equals the entry's MAKEFUN_SHOP_TOKEN. */
 export function isAuthenticated(req: HttpRequest): boolean {
-  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  const presented = bearerToken(req);
-  return presented !== null && presented === expected;
+  const wanted = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  const offered = bearerToken(req);
+  return offered !== null && offered === wanted;
 }
 
 /** One decoded path segment (a segment may itself decode to text containing '/', e.g. a file path). */
-export function decodeSegment(segment: string): string {
+export function decodeSegment(rawSegment: string): string {
   try {
-    return decodeURIComponent(segment);
+    return decodeURIComponent(rawSegment);
   } catch {
-    return segment;
+    return rawSegment;
   }
 }
 
 /** Split a request URL's path into decoded segments. */
 export function pathSegments(url: URL): string[] {
-  return url.pathname.split('/').filter((segment) => segment !== '').map(decodeSegment);
+  return url.pathname.split('/').filter((piece) => piece !== '').map(decodeSegment);
 }
 
 /** A query parameter as a positive integer, or the fallback. */
 export function intParam(url: URL, name: string, fallback: number): number {
-  const raw = url.searchParams.get(name);
-  if (raw === null) return fallback;
-  const value = Number.parseInt(raw, 10);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+  const text = url.searchParams.get(name);
+  if (text === null) return fallback;
+  const parsed = Number.parseInt(text, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 /** Slice a list by ?page / ?per_page (GitHub's defaults: page 1, 30 per page). */
-export function paginate<T>(items: readonly T[], url: URL): T[] {
-  const perPage = Math.min(100, intParam(url, 'per_page', 30));
-  const page = intParam(url, 'page', 1);
-  return items.slice((page - 1) * perPage, page * perPage);
+export function paginate<T>(list: readonly T[], url: URL): T[] {
+  const pageSize = Math.min(100, intParam(url, 'per_page', 30));
+  const pageNumber = intParam(url, 'page', 1);
+  return list.slice((pageNumber - 1) * pageSize, pageNumber * pageSize);
 }
